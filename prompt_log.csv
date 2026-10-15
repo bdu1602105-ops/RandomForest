@@ -1,0 +1,4 @@
+prompt,accuracy,macro_f1,format_compliance,avg_latency_s
+v1_baseline,0.0,0.0,0.0,1.7642974853515625e-05
+v2_role_format,0.0,0.0,0.0,1.806020736694336e-05
+v3_definitions_examples,0.0,0.0,0.0,1.9669532775878906e-05
