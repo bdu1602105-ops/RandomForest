@@ -1,0 +1,8 @@
+langchain-core
+langgraph
+langchain-google-genai
+pandas
+numpy
+matplotlib
+seaborn
+python-dotenv
