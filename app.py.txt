@@ -1,0 +1,337 @@
+import io
+import os
+import traceback
+from contextlib import redirect_stdout
+from typing import Annotated, Optional, Sequence, TypedDict
+ 
+import matplotlib
+matplotlib.use("Agg")  # draw charts to files, no window needed
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from dotenv import load_dotenv
+ 
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+ 
+# ============================================================
+# 0. SETUP: API key and model
+# ============================================================
+load_dotenv()  # reads GEMINI_API_KEY from a .env file
+ 
+api_key = os.getenv("GEMINI_API_KEY")
+ 
+# Optional: if you run this inside Google Colab, use the Colab secret instead
+if not api_key:
+    try:
+        from google.colab import userdata  # only exists in Colab
+        api_key = userdata.get("GEMINI_API_KEY")
+    except Exception:
+        pass
+ 
+# ============================================================
+# 1. SHARED MEMORY: the loaded dataset
+# ============================================================
+_df: Optional[pd.DataFrame] = None
+ 
+ 
+# ============================================================
+# 2. TOOLS (the "hands" of the agent)
+# ============================================================
+@tool
+def load_dataset(file_path: str) -> str:
+    """
+    Load a CSV file into memory so other tools can use it.
+ 
+    Args:
+        file_path: Path to the CSV file (example: "sample_data.csv")
+ 
+    Returns:
+        A short summary of the loaded data (rows, columns, column names).
+    """
+    global _df
+    try:
+        _df = pd.read_csv(file_path)
+        return (
+            f"Dataset loaded successfully!\n"
+            f"Shape: {_df.shape[0]} rows x {_df.shape[1]} columns\n"
+            f"Columns: {list(_df.columns)}\n"
+            f"Data types:\n{_df.dtypes.to_string()}"
+        )
+    except Exception as e:
+        return f"Error loading file: {e}"
+ 
+ 
+@tool
+def describe_data() -> str:
+    """
+    Get a statistical overview of the currently loaded dataset.
+    Shows shape, missing values, basic statistics, and first few rows.
+ 
+    Call this AFTER loading a dataset.
+    """
+    if _df is None:
+        return "No dataset loaded. Please call load_dataset first."
+ 
+    buffer = io.StringIO()
+    buffer.write("=== DATASET OVERVIEW ===\n")
+    buffer.write(f"Shape: {_df.shape[0]} rows x {_df.shape[1]} columns\n\n")
+    buffer.write("=== MISSING VALUES ===\n")
+    buffer.write(_df.isnull().sum().to_string() + "\n\n")
+    buffer.write("=== BASIC STATISTICS (numeric columns) ===\n")
+    buffer.write(_df.describe().to_string() + "\n\n")
+    buffer.write("=== FIRST 5 ROWS ===\n")
+    buffer.write(_df.head().to_string() + "\n")
+    return buffer.getvalue()
+ 
+ 
+@tool
+def run_python_code(code: str) -> str:
+    """
+    Execute Python code on the loaded dataset.
+    The dataframe is available as the variable `df`.
+    You can also use pandas (as pd), numpy (as np), matplotlib.pyplot (as plt),
+    and seaborn (as sns).
+ 
+    IMPORTANT RULES:
+    - Always use `df` for the loaded data.
+    - For final numeric/string results, assign them to a variable called `result`.
+    - You may also use print() to show values.
+ 
+    Example:
+        result = df.groupby("category")["sales"].sum().sort_values(ascending=False)
+ 
+    Args:
+        code: A string containing valid Python code.
+ 
+    Returns:
+        The result of the code or an error message.
+    """
+    if _df is None:
+        return "No dataset loaded. Please call load_dataset first."
+ 
+    env = {"df": _df.copy(), "pd": pd, "np": np, "plt": plt, "sns": sns, "result": None}
+    stdout_buffer = io.StringIO()
+ 
+    try:
+        with redirect_stdout(stdout_buffer):
+            exec(code, env)
+ 
+        printed = stdout_buffer.getvalue()
+        res = env.get("result")
+ 
+        if res is not None:
+            text = res.to_string() if isinstance(res, (pd.DataFrame, pd.Series)) else str(res)
+            return printed + "\n" + text
+ 
+        return printed or "Code executed (no explicit result returned)."
+ 
+    except Exception:
+        return f"Error while executing code:\n{traceback.format_exc()}"
+ 
+ 
+@tool
+def create_chart(code: str, filename: str = "chart.png") -> str:
+    """
+    Create a visualization and save it as an image file.
+ 
+    The dataframe is available as `df`. Libraries: pd, np, plt, sns.
+    Write matplotlib/seaborn code and end with:
+        plt.savefig(filename)
+        plt.close()
+ 
+    Args:
+        code: Python code that creates a plot.
+        filename: Name of the file to save the chart (default: chart.png)
+ 
+    Returns:
+        Confirmation message or error.
+    """
+    if _df is None:
+        return "No dataset loaded."
+ 
+    env = {"df": _df.copy(), "pd": pd, "np": np, "plt": plt, "sns": sns, "filename": filename}
+ 
+    try:
+        exec(code, env)
+        plt.close("all")
+        return f"Chart saved successfully as '{filename}'"
+    except Exception:
+        plt.close("all")
+        return f"Error creating chart:\n{traceback.format_exc()}"
+ 
+ 
+tools = [load_dataset, describe_data, run_python_code, create_chart]
+ 
+# ============================================================
+# 3. MODEL (created AFTER the tools exist)
+# ============================================================
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
+llm_with_tools = llm.bind_tools(tools)
+ 
+ 
+# ============================================================
+# 4. AGENT STATE
+# ============================================================
+class AgentState(TypedDict):
+    """The shared state that travels through the graph."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+ 
+ 
+# ============================================================
+# 5. NODES
+# ============================================================
+SYSTEM_PROMPT = """You are an expert Automated Data Analysis Agent.
+ 
+Your job is to help the user analyze CSV data thoroughly and clearly.
+ 
+Follow this workflow whenever possible:
+1. Load the dataset using `load_dataset` if it is not loaded yet.
+2. Call `describe_data` to understand the structure, missing values, and basic statistics.
+3. Based on the user's question, decide what analysis is needed.
+4. Use `run_python_code` to perform calculations, grouping, filtering, correlations, etc.
+5. If a chart would help, use `create_chart`.
+6. Finally, give a clear, friendly explanation of the findings in natural language.
+ 
+Important rules:
+- Always think step by step.
+- Prefer writing correct pandas code.
+- If code fails, read the error and fix it in the next step.
+- Be honest about data limitations (missing values, small sample size, etc.).
+- When you are finished, give the final answer without calling more tools.
+"""
+ 
+ 
+def agent_node(state: AgentState):
+    """The brain: decide to call a tool or give the final answer."""
+    messages = list(state["messages"])
+ 
+    if not any(isinstance(m, SystemMessage) for m in messages):
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+ 
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
+ 
+ 
+tool_node = ToolNode(tools)
+ 
+ 
+def should_continue(state: AgentState):
+    """Router: run tools if requested, otherwise finish."""
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "tools"
+    return END
+ 
+ 
+# ============================================================
+# 6. BUILD THE GRAPH
+# ============================================================
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tool_node)
+workflow.set_entry_point("agent")
+workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+workflow.add_edge("tools", "agent")  # after tools, go back to the brain
+ 
+app = workflow.compile()
+ 
+ 
+# ============================================================
+# 7. HELPERS
+# ============================================================
+def create_sample_csv(filename: str = "sample_data.csv") -> str:
+    """Create a sample sales dataset with random (but reproducible) values."""
+    rng = np.random.default_rng(42)
+    n = 200
+ 
+    products = ["Laptop", "Phone", "Tablet", "Monitor", "Keyboard"]
+    prices = {"Laptop": 999, "Phone": 699, "Tablet": 399, "Monitor": 249, "Keyboard": 49}
+ 
+    df = pd.DataFrame({
+        "date": pd.date_range("2024-01-01", periods=n, freq="D").astype(str),
+        "region": rng.choice(["North", "South", "East", "West"], n),
+        "product": rng.choice(products, n),
+        "units_sold": rng.integers(1, 60, n),
+        "customer_type": rng.choice(["New", "Returning"], n, p=[0.4, 0.6]),
+    })
+    df["unit_price"] = df["product"].map(prices)
+    df["revenue"] = df["units_sold"] * df["unit_price"]
+ 
+    # Add a few missing values so the agent has something to notice
+    df.loc[rng.choice(n, 5, replace=False), "units_sold"] = np.nan
+ 
+    df.to_csv(filename, index=False)
+    print(f"Sample data created -> {filename}")
+    return filename
+ 
+ 
+def get_text(content) -> str:
+    """Gemini sometimes returns a list of parts; turn it into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+        return "".join(parts)
+    return str(content)
+ 
+ 
+# ============================================================
+# 8. MAIN INTERACTIVE LOOP
+# ============================================================
+def run_agent():
+    print("=" * 60)
+    print("Automated Data Analysis Agent is ready!")
+    print("=" * 60)
+    print("Type your questions. Examples:")
+    print("  - Load sample_data.csv and describe it")
+    print("  - What is the total revenue by region?")
+    print("  - Which product sold the most units?")
+    print("  - Create a bar chart of revenue by region")
+    print("Type 'quit' or 'exit' to stop.\n")
+ 
+    if not os.path.exists("sample_data.csv"):
+        create_sample_csv()
+ 
+    messages = []
+ 
+    while True:
+        user_input = input("\nYou: ").strip()
+        if user_input.lower() in ["quit", "exit", "q"]:
+            print("Goodbye!")
+            break
+        if not user_input:
+            continue
+ 
+        messages.append(HumanMessage(content=user_input))
+        print("\nAgent is thinking...\n")
+ 
+        try:
+            # recursion_limit stops the agent from looping forever
+            result = app.invoke({"messages": messages}, {"recursion_limit": 15})
+            messages = result["messages"]
+            print("Agent:", get_text(messages[-1].content))
+        except Exception as e:
+            print(f"Something went wrong: {e}")
+            messages.pop()  # remove the failed question so the chat can continue
+ 
+ 
+# ============================================================
+# 9. ENTRY POINT
+# ============================================================
+if __name__ == "__main__":
+    if not api_key:
+        print("Please set GEMINI_API_KEY in a .env file or your environment.")
+        print("Example .env line:  GEMINI_API_KEY=your_key_here")
+    else:
+        run_agent()
